@@ -828,9 +828,10 @@ Noc::async_write(
     ASSERT(src_args.offset_bytes == 0);
     const uint32_t entry_bytes = src.get_entry_size();
     const uint32_t share = src.get_consumer_share();
+    constexpr bool posted = has_flag(opts, NocOptions::POSTED);
     auto issue = [&](uint32_t txn_id, uint32_t src_addr, uint32_t bytes) {
         auto issue_at = [&](uint64_t dst_noc_addr) {
-            RECORD_NOC_EVENT_WITH_ADDR(NocEventType::WRITE_WITH_TRID, src_addr, dst_noc_addr, bytes, -1, false, noc_id_);
+            RECORD_NOC_EVENT_WITH_ADDR(NocEventType::WRITE_WITH_TRID, src_addr, dst_noc_addr, bytes, -1, posted, noc_id_);
             DEBUG_SANITIZE_NOC_WRITE_TRANSACTION(noc_id_, dst_noc_addr, src_addr, bytes);
             ncrisc_noc_fast_write_any_len<noc_mode, true, /*one_packet*/ false>(
                 noc_id_,
@@ -843,11 +844,11 @@ Noc::async_write(
                 /*linked*/ false,
                 /*num_dests*/ 1,
                 /*multicast_path_reserve*/ true,
-                /*posted*/ false,
+                posted,
                 txn_id);
         };
         if constexpr (noc_addrgen_push_v<Dst>) {
-            issue_write_maybe_pushed</*posted=*/false, /*use_trid=*/true, /*trace=*/true>(
+            issue_write_maybe_pushed<posted, /*use_trid=*/true, /*trace=*/true>(
                 dst, dst_args, src_addr, bytes, NOC_UNICAST_WRITE_VC, txn_id, issue_at);
         } else {
             issue_at(get_dst_ptr<AddressType::NOC>(dst, dst_args));
