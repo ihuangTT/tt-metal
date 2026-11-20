@@ -45,8 +45,12 @@ struct BmmParams {
     std::uint32_t Mt, Kt, Nt;
     std::uint32_t B_total;     // total batch count (buffer sizing + validation)
     std::uint32_t B_per_core;  // batch count per core (kernel runtime args)
-    std::uint32_t num_threads = 2;
+    std::uint32_t num_threads = 2;     // compute threads (Tensix NEOs on Quasar)
+    std::uint32_t reader_threads = 0;  // 0: num_threads
+    std::uint32_t writer_threads = 0;  // 0: num_threads
     std::uint32_t num_input_tiles = 4;
+    std::uint32_t num_input_tiles_B = 0;  // src1 entries; 0: num_input_tiles
+    bool posted_writes = false;           // writer_bmm_8bank_posted.cpp: C goes to DRAM as posted writes
     std::uint32_t num_output_tiles = 4;
     std::uint32_t single_tile_size = 2 * 1024;
     std::uint32_t transpose = 0;
@@ -134,7 +138,7 @@ ProgramSpec build_bmm_program_spec(
     DataflowBufferSpec src1_dfb_spec{
         .unique_id = SRC1_DFB,
         .entry_size = p.single_tile_size,
-        .num_entries = p.num_input_tiles,
+        .num_entries = p.num_input_tiles_B ? p.num_input_tiles_B : p.num_input_tiles,
         .data_format_metadata = tt::DataFormat::Float16_b,
     };
     DataflowBufferSpec dst_dfb_spec{
@@ -147,7 +151,7 @@ ProgramSpec build_bmm_program_spec(
     KernelSpec reader_spec{
         .unique_id = READER,
         .source = "tests/tt_metal/tt_metal/test_kernels/dataflow/reader_bmm_8bank.cpp",
-        .num_threads = p.num_threads,
+        .num_threads = p.reader_threads ? p.reader_threads : p.num_threads,
         .dfb_bindings = {ProducerOf(SRC0_DFB, "src0"), ProducerOf(SRC1_DFB, "src1")},
         .tensor_bindings =
             {{.tensor_parameter_name = SRC0_T, .accessor_name = "src0"},
@@ -162,8 +166,9 @@ ProgramSpec build_bmm_program_spec(
 
     KernelSpec writer_spec{
         .unique_id = WRITER,
-        .source = "tests/tt_metal/tt_metal/test_kernels/dataflow/writer_bmm_8bank.cpp",
-        .num_threads = p.num_threads,
+        .source = p.posted_writes ? "tests/tt_metal/tt_metal/test_kernels/dataflow/writer_bmm_8bank_posted.cpp"
+                                  : "tests/tt_metal/tt_metal/test_kernels/dataflow/writer_bmm_8bank.cpp",
+        .num_threads = p.writer_threads ? p.writer_threads : p.num_threads,
         .dfb_bindings = {ConsumerOf(DST_DFB, "dst")},
         .tensor_bindings = {{.tensor_parameter_name = DST_T, .accessor_name = "dst"}},
         .runtime_arg_schema = {.runtime_arg_names = {"batch_start"}, .common_runtime_arg_names = {"Mt", "Nt", "batch"}},
@@ -344,6 +349,31 @@ TEST_F(AnyDispatchMeshDeviceSingleCardFixture, Bmm) {
     run_bmm_single_node(mesh_device, single_node_bmm_params(mesh_device.arch()));
 }
 
+// Every Tensix NEO of a Quasar node, fed from DRAM. Each kernel splits the output rows by thread
+// (row mt belongs to thread mt % threads): 4 readers fetch A's row mt and, with Kt = 4, B's column
+// (the reader whose id is both mt and kt fetches B(kt, nt), so B's column comes once, in kt order,
+// and every NEO sees it); 4 NEOs compute a row each; 2 writers take rows mt % 2, which with Nt = 1
+// is exactly the STRIDED 4 -> 2 dealing of the output buffer. 4 + 2 DMs fit the 6 user DMs.
+TEST_F(QuasarMeshDeviceSingleCardFixture, BmmAllNeos) {
+    auto& mesh_device = *devices_[0];
+    BmmParams p;
+    p.Mt = 4;
+    p.Kt = 4;
+    p.Nt = 1;
+    p.B_total = 1;
+    p.B_per_core = 1;
+    p.num_threads = 4;
+    p.reader_threads = 4;
+    p.writer_threads = 2;
+    // Implicit sync credits a DFB only when every producer has done its share of a txn-id batch, so B(0)
+    // reaches the NEOs only once all 4 readers have issued their B tile. Reader r issues B(r) after A(r,0..r),
+    // so each reader's share of src0 must hold 4 tiles (16 / 4 producers), or the readers block on A while
+    // the NEOs wait on B. With 8 entries (2 per producer) this deadlocks.
+    p.num_input_tiles = 16;
+    p.num_output_tiles = 8;
+    run_bmm_single_node(mesh_device, p);
+}
+
 TEST_F(AnyDispatchMeshDeviceSingleCardFixture, BmmTranspose) {
     auto& mesh_device = *devices_[0];
     BmmParams p = single_node_bmm_params(mesh_device.arch());
@@ -420,6 +450,136 @@ TEST_F(QuasarMeshDeviceSingleCardFixture, BmmMultinode) {
     int argfail = -1;
     bool pass = validate_bmm_result(p, inputs.src0, inputs.src1, result_vec, &argfail);
     EXPECT_TRUE(pass) << "Failure position=" << argfail;
+}
+
+// BmmAllNeos's layout (4 readers, 4 NEOs, 2 writers) on every worker node of the device at once: each node
+// computes its own B_per_core batches (batch_start = node index * B_per_core), so every Tensix NEO of the grid
+// is busy and all nodes move their tiles to and from DRAM concurrently. The program is launched `launches`
+// times; dst is zeroed before each launch so a launch cannot pass on its predecessor's output.
+void run_bmm_all_neos_all_nodes(distributed::MeshDevice& mesh_device, BmmParams p, std::uint32_t launches) {
+    const auto grid = mesh_device.compute_with_storage_grid_size();
+    const std::uint32_t num_nodes = grid.x * grid.y;
+    if (num_nodes < 2) {
+        GTEST_SKIP() << "This test requires at least 2 worker nodes.";
+    }
+    p.B_total = num_nodes * p.B_per_core;
+    p.num_threads = 4;
+    p.reader_threads = 4;
+    p.writer_threads = 2;
+
+    auto tensors = create_bmm_tensors(mesh_device, p);
+    const NodeRange node_range{{0, 0}, {grid.x - 1, grid.y - 1}};
+
+    ProgramRunArgs::KernelRunArgs::RuntimeArgValues batch_start;
+    std::uint32_t index = 0;
+    for (std::uint32_t y = 0; y < grid.y; y++) {
+        for (std::uint32_t x = 0; x < grid.x; x++) {
+            AddRuntimeArgsForNode(
+                batch_start, NodeCoord{x, y}, {{"batch_start", index++ * p.B_per_core}});
+        }
+    }
+
+    const BmmInputs inputs = make_bmm_inputs(p);
+    slow_dispatch::WriteToBuffer(tensors.src0.mesh_buffer(), inputs.src0);
+    slow_dispatch::WriteToBuffer(tensors.src1.mesh_buffer(), inputs.src1);
+    const std::vector<std::uint32_t> zeros(p.Mt * p.Nt * p.B_total * p.single_tile_size / sizeof(std::uint32_t), 0);
+
+    constexpr std::uint32_t do_bcast = 0;
+    for (std::uint32_t launch = 0; launch < launches; launch++) {
+        auto spec = build_bmm_program_spec(p, tensors, node_range, /*use_implicit_sync=*/true);
+        tt_metal::Program program(mesh_device, spec);
+        ProgramRunArgs params;
+        params.kernel_run_args = {
+            ProgramRunArgs::KernelRunArgs{
+                .kernel = READER,
+                .runtime_arg_values = batch_start,
+                .common_runtime_arg_values =
+                    {{"Mt", p.Mt},
+                     {"Kt", p.Kt},
+                     {"Nt", p.Nt},
+                     {"MtKt", p.Mt * p.Kt},
+                     {"KtNt", p.Kt * p.Nt},
+                     {"batch", p.B_per_core},
+                     {"do_bcast", do_bcast}},
+            },
+            ProgramRunArgs::KernelRunArgs{
+                .kernel = WRITER,
+                .runtime_arg_values = batch_start,
+                .common_runtime_arg_values = {{"Mt", p.Mt}, {"Nt", p.Nt}, {"batch", p.B_per_core}},
+            },
+            ProgramRunArgs::KernelRunArgs{.kernel = COMPUTE},
+        };
+        params.tensor_args = {
+            {SRC0_T, TensorArgument{tensors.src0}},
+            {SRC1_T, TensorArgument{tensors.src1}},
+            {DST_T, TensorArgument{tensors.dst}},
+        };
+        program.set_program_run_args(params);
+
+        slow_dispatch::WriteToBuffer(tensors.dst.mesh_buffer(), zeros);
+        LaunchProgram(mesh_device, std::move(program));
+
+        std::vector<std::uint32_t> result_vec;
+        slow_dispatch::ReadFromBuffer(tensors.dst.mesh_buffer(), result_vec);
+        int argfail = -1;
+        bool pass = validate_bmm_result(p, inputs.src0, inputs.src1, result_vec, &argfail);
+        EXPECT_TRUE(pass) << "launch " << launch << ": failure position=" << argfail;
+    }
+}
+
+TEST_F(QuasarMeshDeviceSingleCardFixture, BmmAllNeosMultinode) {
+    BmmParams p;
+    p.Mt = 4;
+    p.Kt = 4;
+    p.Nt = 1;
+    p.B_per_core = 1;
+    p.num_input_tiles = 16;  // see BmmAllNeos
+    p.num_output_tiles = 8;
+    run_bmm_all_neos_all_nodes(*devices_[0], p, /*launches=*/1);
+}
+
+// BmmAllNeosMultinode scaled up: 2 output rows per NEO, 4 batches per node, 3 launches. Mt and Kt stay
+// multiples of 4, the reader count, so each B tile's reader lines up with the NEOs' order. Nt stays 1: each
+// writer takes dst entries from its two NEOs in turn, which is the row order only when a row is one tile.
+// Kt stays 4: with Kt = 8 (256-term bf16 sums) a few values in a million land just outside the 5% tolerance.
+// src0 holds 8 tiles per reader; src1 is sized for one B tile per reader per txn-id batch.
+TEST_F(QuasarMeshDeviceSingleCardFixture, BmmAllNeosMultinodeLarge) {
+    BmmParams p;
+    p.Mt = 8;
+    p.Kt = 4;
+    p.Nt = 1;
+    p.B_per_core = 4;
+    p.num_input_tiles = 32;
+    p.num_input_tiles_B = 8;
+    p.num_output_tiles = 8;
+    run_bmm_all_neos_all_nodes(*devices_[0], p, /*launches=*/3);
+}
+
+// BmmAllNeosMultinode and BmmAllNeosMultinodeLarge with C written to DRAM as posted writes: the writers' DFB
+// credits come from WR_SENT (the write has left the node) rather than from DRAM's acknowledgement.
+TEST_F(QuasarMeshDeviceSingleCardFixture, BmmAllNeosMultinodePosted) {
+    BmmParams p;
+    p.Mt = 4;
+    p.Kt = 4;
+    p.Nt = 1;
+    p.B_per_core = 1;
+    p.num_input_tiles = 16;
+    p.num_output_tiles = 8;
+    p.posted_writes = true;
+    run_bmm_all_neos_all_nodes(*devices_[0], p, /*launches=*/1);
+}
+
+TEST_F(QuasarMeshDeviceSingleCardFixture, BmmAllNeosMultinodeLargePosted) {
+    BmmParams p;
+    p.Mt = 8;
+    p.Kt = 4;
+    p.Nt = 1;
+    p.B_per_core = 4;
+    p.num_input_tiles = 32;
+    p.num_input_tiles_B = 8;
+    p.num_output_tiles = 8;
+    p.posted_writes = true;
+    run_bmm_all_neos_all_nodes(*devices_[0], p, /*launches=*/3);
 }
 
 TEST_F(QuasarMeshDeviceSingleCardFixture, TraceBmm) {
