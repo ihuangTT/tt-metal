@@ -67,7 +67,12 @@ inline std::string get_core_descriptor_file(
                 case tt::ARCH::WORMHOLE_B0: return core_desc_dir + "wormhole_b0_versim_1x1_arch.yaml";
                 case tt::ARCH::BLACKHOLE: return core_desc_dir + "blackhole_simulation_1x2_arch.yaml";
                 case tt::ARCH::QUASAR:
-                    // Small Quasar sims: x_size=1 -> 1x3, x_size=2 -> 2x3
+                    // Small Quasar sims: x_size=1 -> 1x3; x_size=2 -> 2x3, or 2x4 (two worker rows) when y_size >= 4
+                    if (grid_size.x >= 2 && grid_size.y >= 4) {
+                        return core_desc_dir + (quasar_tensix_dispatch_fd
+                                                    ? "quasar_simulation_2x4_arch_tensix_dispatch.yaml"
+                                                    : "quasar_simulation_2x4_arch.yaml");
+                    }
                     if (grid_size.x >= 2) {
                         return core_desc_dir + (quasar_tensix_dispatch_fd
                                                     ? "quasar_simulation_2x3_arch_tensix_dispatch.yaml"
